@@ -28,6 +28,20 @@ fn main() {
             continue;
         }
 
+        if cmd == "type" {
+            if let Some(query) = parts.next() {
+                match query {
+                    "echo" | "exit" | "type" => {
+                        println!("{query} is a shell builtin");
+                    }
+                    _ => {
+                        println!("{query}: not found");
+                    }
+                }
+            }
+            continue;
+        }
+
         println!("{cmd}: command not found");
     }
 }
