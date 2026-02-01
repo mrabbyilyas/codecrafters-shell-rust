@@ -49,20 +49,21 @@ fn main() {
         let Some(cmd) = parts.next() else {
             continue;
         };
+        let args = parts.map(|s| s.to_string()).collect::<Vec<_>>();
 
         if cmd == "exit" {
             break;
         }
 
         if cmd == "echo" {
-            let output = parts.collect::<Vec<_>>().join(" ");
+            let output = args.join(" ");
             println!("{output}");
             continue;
         }
 
         if cmd == "type" {
-            if let Some(query) = parts.next() {
-                match query {
+            if let Some(query) = args.first() {
+                match query.as_str() {
                     "echo" | "exit" | "type" => {
                         println!("{query} is a shell builtin");
                     }
@@ -75,6 +76,16 @@ fn main() {
                         }
                     },
                 }
+            }
+            continue;
+        }
+
+        if let Some(_path) = find_in_path(cmd) {
+            let status = std::process::Command::new(cmd)
+                .args(&args)
+                .status();
+            if status.is_err() {
+                println!("{cmd}: command not found");
             }
             continue;
         }
