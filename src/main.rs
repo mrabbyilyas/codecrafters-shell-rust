@@ -13,11 +13,21 @@ fn main() {
             break; // EOF
         }
 
-        if let Some(cmd) = input.split_whitespace().next() {
-            if cmd == "exit" {
-                break;
-            }
-            println!("{cmd}: command not found");
+        let mut parts = input.split_whitespace();
+        let Some(cmd) = parts.next() else {
+            continue;
+        };
+
+        if cmd == "exit" {
+            break;
         }
+
+        if cmd == "echo" {
+            let output = parts.collect::<Vec<_>>().join(" ");
+            println!("{output}");
+            continue;
+        }
+
+        println!("{cmd}: command not found");
     }
 }
