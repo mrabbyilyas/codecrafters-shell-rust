@@ -14,6 +14,9 @@ fn main() {
         }
 
         if let Some(cmd) = input.split_whitespace().next() {
+            if cmd == "exit" {
+                break;
+            }
             println!("{cmd}: command not found");
         }
     }
