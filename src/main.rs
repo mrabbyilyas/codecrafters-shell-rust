@@ -32,6 +32,72 @@ fn find_in_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+fn parse_line(input: &str) -> Vec<String> {
+    #[derive(Copy, Clone)]
+    enum State {
+        Normal,
+        Single,
+        Double,
+    }
+
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut state = State::Normal;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Normal => match ch {
+                '\'' => state = State::Single,
+                '"' => state = State::Double,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(current.clone());
+                        current.clear();
+                    }
+                }
+                _ => current.push(ch),
+            },
+            State::Single => {
+                if ch == '\'' {
+                    state = State::Normal;
+                } else {
+                    current.push(ch);
+                }
+            }
+            State::Double => match ch {
+                '"' => state = State::Normal,
+                '\\' => {
+                    if let Some(next) = chars.peek().copied() {
+                        if next == '"' || next == '\\' {
+                            chars.next();
+                            current.push(next);
+                        } else {
+                            current.push('\\');
+                        }
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
+}
+
 fn main() {
     let mut input = String::new();
 
@@ -45,11 +111,11 @@ fn main() {
             break; // EOF
         }
 
-        let mut parts = input.split_whitespace();
-        let Some(cmd) = parts.next() else {
+        let args = parse_line(&input);
+        let Some(cmd) = args.first() else {
             continue;
         };
-        let args = parts.map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = args[1..].to_vec();
 
         if cmd == "exit" {
             break;
