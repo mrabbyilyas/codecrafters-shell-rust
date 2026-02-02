@@ -61,10 +61,39 @@ fn main() {
             continue;
         }
 
+        if cmd == "pwd" {
+            if let Ok(dir) = env::current_dir() {
+                println!("{}", dir.display());
+            }
+            continue;
+        }
+
+        if cmd == "cd" {
+            if let Some(target) = args.first() {
+                let resolved = if target == "~" {
+                    env::var_os("HOME").map(PathBuf::from)
+                } else {
+                    Some(PathBuf::from(target))
+                };
+
+                match resolved {
+                    Some(path) => {
+                        if env::set_current_dir(&path).is_err() {
+                            println!("cd: {target}: No such file or directory");
+                        }
+                    }
+                    None => {
+                        println!("cd: {target}: No such file or directory");
+                    }
+                }
+            }
+            continue;
+        }
+
         if cmd == "type" {
             if let Some(query) = args.first() {
                 match query.as_str() {
-                    "echo" | "exit" | "type" => {
+                    "echo" | "exit" | "type" | "pwd" | "cd" => {
                         println!("{query} is a shell builtin");
                     }
                     _ => match find_in_path(query) {
