@@ -101,6 +101,17 @@ fn ring_bell() {
 }
 
 #[cfg(unix)]
+fn redraw_input_line(buffer: &str, shown_len: &mut usize) {
+    print!("\r{PROMPT}{buffer}");
+    if *shown_len > buffer.len() {
+        let pad = " ".repeat(*shown_len - buffer.len());
+        print!("{pad}\r{PROMPT}{buffer}");
+    }
+    let _ = io::stdout().flush();
+    *shown_len = buffer.len();
+}
+
+#[cfg(unix)]
 struct RawModeGuard {
     fd: i32,
     original: libc::termios,
@@ -188,9 +199,11 @@ fn complete_buffer(buffer: &mut String, pending_multi: &mut Option<String>) {
 }
 
 #[cfg(unix)]
-fn read_user_input() -> io::Result<Option<String>> {
+fn read_user_input(history: &[String]) -> io::Result<Option<String>> {
     let mut input = String::new();
     let mut pending_multi = None;
+    let mut history_cursor: Option<usize> = None;
+    let mut shown_len = 0usize;
     let mut stdin = io::stdin();
 
     loop {
@@ -209,14 +222,65 @@ fn read_user_input() -> io::Result<Option<String>> {
             }
             b'\t' => {
                 complete_buffer(&mut input, &mut pending_multi);
+                shown_len = input.len();
+                history_cursor = None;
             }
             127 | 8 => {
                 if !input.is_empty() {
                     input.pop();
                     print!("\x08 \x08");
                     let _ = io::stdout().flush();
+                    shown_len = shown_len.saturating_sub(1);
                 }
                 pending_multi = None;
+                history_cursor = None;
+            }
+            b'\x1b' => {
+                let mut seq = [0_u8; 2];
+                if stdin.read_exact(&mut seq).is_err() {
+                    continue;
+                }
+
+                if seq[0] != b'[' {
+                    continue;
+                }
+
+                match seq[1] {
+                    b'A' => {
+                        if history.is_empty() {
+                            continue;
+                        }
+
+                        history_cursor = Some(match history_cursor {
+                            None => history.len() - 1,
+                            Some(0) => 0,
+                            Some(idx) => idx - 1,
+                        });
+
+                        if let Some(idx) = history_cursor {
+                            input = history[idx].clone();
+                            redraw_input_line(&input, &mut shown_len);
+                        }
+                        pending_multi = None;
+                    }
+                    b'B' => {
+                        let Some(idx) = history_cursor else {
+                            continue;
+                        };
+
+                        if idx + 1 < history.len() {
+                            history_cursor = Some(idx + 1);
+                            input = history[idx + 1].clone();
+                        } else {
+                            history_cursor = None;
+                            input.clear();
+                        }
+
+                        redraw_input_line(&input, &mut shown_len);
+                        pending_multi = None;
+                    }
+                    _ => {}
+                }
             }
             4 => {
                 if input.is_empty() {
@@ -231,6 +295,8 @@ fn read_user_input() -> io::Result<Option<String>> {
                 print!("{c}");
                 let _ = io::stdout().flush();
                 pending_multi = None;
+                history_cursor = None;
+                shown_len += 1;
             }
             _ => {}
         }
@@ -238,7 +304,7 @@ fn read_user_input() -> io::Result<Option<String>> {
 }
 
 #[cfg(not(unix))]
-fn read_user_input() -> io::Result<Option<String>> {
+fn read_user_input(_history: &[String]) -> io::Result<Option<String>> {
     let mut input = String::new();
     let bytes = io::stdin().read_line(&mut input)?;
     if bytes == 0 {
@@ -444,7 +510,7 @@ fn split_pipeline(tokens: Vec<ParsedToken>) -> Vec<Vec<ParsedToken>> {
 }
 
 fn is_builtin_command(cmd: &str) -> bool {
-    matches!(cmd, "echo" | "exit" | "type" | "pwd" | "cd")
+    matches!(cmd, "echo" | "exit" | "type" | "pwd" | "cd" | "history")
 }
 
 #[derive(Default)]
@@ -454,7 +520,26 @@ struct CommandResult {
     should_exit: bool,
 }
 
-fn run_builtin(cmd: &str, args: &[String], allow_exit: bool, apply_cd: bool) -> Option<CommandResult> {
+fn format_history(history: &[String], limit: Option<usize>) -> Vec<u8> {
+    let start = match limit {
+        Some(n) => history.len().saturating_sub(n),
+        None => 0,
+    };
+
+    let mut out = String::new();
+    for (idx, entry) in history.iter().enumerate().skip(start) {
+        out.push_str(&format!("{:>5}  {entry}\n", idx + 1));
+    }
+    out.into_bytes()
+}
+
+fn run_builtin(
+    cmd: &str,
+    args: &[String],
+    allow_exit: bool,
+    apply_cd: bool,
+    history: &[String],
+) -> Option<CommandResult> {
     let mut result = CommandResult::default();
 
     match cmd {
@@ -505,6 +590,10 @@ fn run_builtin(cmd: &str, args: &[String], allow_exit: bool, apply_cd: bool) -> 
                     result.stdout = format!("{query}: not found\n").into_bytes();
                 }
             }
+        }
+        "history" => {
+            let limit = args.first().and_then(|s| s.parse::<usize>().ok());
+            result.stdout = format_history(history, limit);
         }
         _ => return None,
     }
@@ -672,14 +761,16 @@ fn execute_external_pipeline(stages: &[PipelineStage]) {
     }
 }
 
-fn execute_mixed_pipeline(stages: &[PipelineStage]) {
+fn execute_mixed_pipeline(stages: &[PipelineStage], history: &[String]) {
     let mut stdin_buffer = Vec::new();
 
     for (idx, stage) in stages.iter().enumerate() {
         ensure_redirect_files(&stage.redirects);
         let is_last = idx + 1 == stages.len();
 
-        let result = if let Some(result) = run_builtin(&stage.cmd, &stage.args, false, false) {
+        let result = if let Some(result) =
+            run_builtin(&stage.cmd, &stage.args, false, false, history)
+        {
             result
         } else {
             if find_in_path(&stage.cmd).is_none() {
@@ -716,7 +807,7 @@ fn execute_mixed_pipeline(stages: &[PipelineStage]) {
     }
 }
 
-fn execute_pipeline(segments: Vec<Vec<ParsedToken>>) {
+fn execute_pipeline(segments: Vec<Vec<ParsedToken>>, history: &[String]) {
     let stages = build_pipeline_stages(segments);
     if stages.is_empty() {
         return;
@@ -725,26 +816,32 @@ fn execute_pipeline(segments: Vec<Vec<ParsedToken>>) {
     if stages.iter().all(|stage| !is_builtin_command(&stage.cmd)) {
         execute_external_pipeline(&stages);
     } else {
-        execute_mixed_pipeline(&stages);
+        execute_mixed_pipeline(&stages, history);
     }
 }
 
 fn main() {
     #[cfg(unix)]
     let _raw_mode = RawModeGuard::new(STDIN_FILENO).ok();
+    let mut history = Vec::<String>::new();
 
     loop {
         print!("{PROMPT}");
         io::stdout().flush().unwrap();
 
-        let Some(input) = read_user_input().unwrap() else {
+        let Some(input) = read_user_input(&history).unwrap() else {
             break; // EOF
         };
 
         let tokens = parse_line(&input);
+        if tokens.is_empty() {
+            continue;
+        }
+        history.push(input.clone());
+
         let mut pipeline_segments = split_pipeline(tokens);
         if pipeline_segments.len() > 1 {
-            execute_pipeline(pipeline_segments);
+            execute_pipeline(pipeline_segments, &history);
             continue;
         }
 
@@ -756,7 +853,7 @@ fn main() {
         let args = tokens[1..].to_vec();
         ensure_redirect_files(&redirects);
 
-        if let Some(result) = run_builtin(&cmd, &args, true, true) {
+        if let Some(result) = run_builtin(&cmd, &args, true, true, &history) {
             if !result.stdout.is_empty() {
                 write_bytes_output(&result.stdout, OutputStream::Stdout, &redirects);
             }
