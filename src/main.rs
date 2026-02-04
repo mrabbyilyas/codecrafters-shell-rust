@@ -209,6 +209,15 @@ fn open_redirect_file(path: &Path, mode: RedirectMode) -> io::Result<fs::File> {
     options.open(path)
 }
 
+fn ensure_redirect_files(redirects: &RedirectSpec) {
+    if let Some((path, mode)) = &redirects.stdout {
+        let _ = open_redirect_file(path, *mode);
+    }
+    if let Some((path, mode)) = &redirects.stderr {
+        let _ = open_redirect_file(path, *mode);
+    }
+}
+
 enum OutputStream {
     Stdout,
     Stderr,
@@ -258,6 +267,7 @@ fn main() {
             continue;
         };
         let args = tokens[1..].to_vec();
+        ensure_redirect_files(&redirects);
 
         if cmd == "exit" {
             break;
