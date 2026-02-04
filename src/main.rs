@@ -1,4 +1,6 @@
 use std::env;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -6,7 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
+use libc::{self, STDIN_FILENO};
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+const PROMPT: &str = "$ ";
+#[cfg(unix)]
+const COMPLETION_BUILTINS: [&str; 2] = ["echo", "exit"];
 
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
@@ -21,6 +31,220 @@ fn is_executable(path: &Path) -> bool {
     {
         fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
     }
+}
+
+#[cfg(unix)]
+fn completion_matches(prefix: &str) -> Vec<String> {
+    let mut matches = BTreeSet::new();
+
+    for builtin in COMPLETION_BUILTINS {
+        if builtin.starts_with(prefix) {
+            matches.insert(builtin.to_string());
+        }
+    }
+
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !is_executable(&path) {
+                    continue;
+                }
+
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                if name.starts_with(prefix) {
+                    matches.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    matches.into_iter().collect()
+}
+
+#[cfg(unix)]
+fn longest_common_prefix(words: &[String]) -> String {
+    if words.is_empty() {
+        return String::new();
+    }
+
+    let mut prefix = words[0].clone();
+    for word in &words[1..] {
+        let mut next = String::new();
+        for (a, b) in prefix.chars().zip(word.chars()) {
+            if a == b {
+                next.push(a);
+            } else {
+                break;
+            }
+        }
+        prefix = next;
+        if prefix.is_empty() {
+            break;
+        }
+    }
+
+    prefix
+}
+
+#[cfg(unix)]
+fn ring_bell() {
+    print!("\x07");
+    let _ = io::stdout().flush();
+}
+
+#[cfg(unix)]
+struct RawModeGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn new(fd: i32) -> io::Result<Self> {
+        // SAFETY: tcgetattr/tcsetattr are called with a valid tty fd (stdin in tests).
+        unsafe {
+            let mut original = std::mem::zeroed::<libc::termios>();
+            if libc::tcgetattr(fd, &mut original) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut raw = original;
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            raw.c_iflag &= !(libc::ICRNL | libc::IXON);
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Self { fd, original })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore captured terminal attributes on the same fd.
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn complete_buffer(buffer: &mut String, pending_multi: &mut Option<String>) {
+    if buffer.chars().any(char::is_whitespace) {
+        ring_bell();
+        *pending_multi = None;
+        return;
+    }
+
+    let prefix = buffer.clone();
+    let matches = completion_matches(&prefix);
+    if matches.is_empty() {
+        ring_bell();
+        *pending_multi = None;
+        return;
+    }
+
+    if matches.len() == 1 {
+        let word = &matches[0];
+        if word.len() >= prefix.len() {
+            print!("{} ", &word[prefix.len()..]);
+            let _ = io::stdout().flush();
+            *buffer = format!("{word} ");
+        }
+        *pending_multi = None;
+        return;
+    }
+
+    let lcp = longest_common_prefix(&matches);
+    if lcp.len() > prefix.len() {
+        print!("{}", &lcp[prefix.len()..]);
+        let _ = io::stdout().flush();
+        *buffer = lcp;
+        *pending_multi = None;
+        return;
+    }
+
+    if pending_multi.as_deref() == Some(prefix.as_str()) {
+        print!("\r\n{}\r\n{}{}", matches.join("  "), PROMPT, buffer);
+        let _ = io::stdout().flush();
+        *pending_multi = None;
+    } else {
+        ring_bell();
+        *pending_multi = Some(prefix);
+    }
+}
+
+#[cfg(unix)]
+fn read_user_input() -> io::Result<Option<String>> {
+    let mut input = String::new();
+    let mut pending_multi = None;
+    let mut stdin = io::stdin();
+
+    loop {
+        let mut byte = [0_u8; 1];
+        match stdin.read_exact(&mut byte) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+
+        match byte[0] {
+            b'\n' | b'\r' => {
+                print!("\r\n");
+                let _ = io::stdout().flush();
+                return Ok(Some(input));
+            }
+            b'\t' => {
+                complete_buffer(&mut input, &mut pending_multi);
+            }
+            127 | 8 => {
+                if !input.is_empty() {
+                    input.pop();
+                    print!("\x08 \x08");
+                    let _ = io::stdout().flush();
+                }
+                pending_multi = None;
+            }
+            4 => {
+                if input.is_empty() {
+                    print!("\r\n");
+                    let _ = io::stdout().flush();
+                    return Ok(None);
+                }
+            }
+            ch if ch.is_ascii_graphic() || ch == b' ' => {
+                let c = ch as char;
+                input.push(c);
+                print!("{c}");
+                let _ = io::stdout().flush();
+                pending_multi = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_user_input() -> io::Result<Option<String>> {
+    let mut input = String::new();
+    let bytes = io::stdin().read_line(&mut input)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    Ok(Some(input.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 fn find_in_path(cmd: &str) -> Option<PathBuf> {
@@ -249,17 +473,16 @@ fn write_output(text: &str, stream: OutputStream, redirects: &RedirectSpec) {
 }
 
 fn main() {
-    let mut input = String::new();
+    #[cfg(unix)]
+    let _raw_mode = RawModeGuard::new(STDIN_FILENO).ok();
 
     loop {
-        print!("$ ");
+        print!("{PROMPT}");
         io::stdout().flush().unwrap();
 
-        input.clear();
-        let bytes = io::stdin().read_line(&mut input).unwrap();
-        if bytes == 0 {
+        let Some(input) = read_user_input().unwrap() else {
             break; // EOF
-        }
+        };
 
         let tokens = parse_line(&input);
         let (tokens, redirects) = parse_redirections(tokens);
