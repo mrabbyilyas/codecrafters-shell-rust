@@ -533,6 +533,95 @@ fn format_history(history: &[String], limit: Option<usize>) -> Vec<u8> {
     out.into_bytes()
 }
 
+fn read_history_file(path: &Path) -> io::Result<Vec<String>> {
+    let content = fs::read_to_string(path)?;
+    Ok(content.lines().map(|line| line.to_string()).collect())
+}
+
+fn write_history_file(path: &Path, history: &[String]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    for entry in history {
+        writeln!(file, "{entry}")?;
+    }
+
+    Ok(())
+}
+
+fn append_history_file(path: &Path, history: &[String], from: usize) -> io::Result<()> {
+    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    for entry in history.iter().skip(from) {
+        writeln!(file, "{entry}")?;
+    }
+    Ok(())
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn should_append_history_on_exit() -> bool {
+    env_truthy("HISTAPPEND") || env_truthy("HISTFILE_APPEND") || env_truthy("HISTORY_APPEND")
+}
+
+fn run_history_command(
+    args: &[String],
+    history: &mut Vec<String>,
+    histfile: Option<&PathBuf>,
+    history_last_persisted: &mut usize,
+) -> CommandResult {
+    let mut result = CommandResult::default();
+
+    match args.first().map(String::as_str) {
+        Some("-r") => {
+            let path = args.get(1).map(PathBuf::from).or_else(|| histfile.cloned());
+            if let Some(path) = path {
+                if let Ok(lines) = read_history_file(&path) {
+                    history.extend(lines);
+                    *history_last_persisted = history.len();
+                }
+            }
+        }
+        Some("-w") => {
+            let path = args.get(1).map(PathBuf::from).or_else(|| histfile.cloned());
+            if let Some(path) = path {
+                if write_history_file(&path, history).is_ok() {
+                    *history_last_persisted = history.len();
+                }
+            }
+        }
+        Some("-a") => {
+            let path = args.get(1).map(PathBuf::from).or_else(|| histfile.cloned());
+            if let Some(path) = path {
+                if append_history_file(&path, history, *history_last_persisted).is_ok() {
+                    *history_last_persisted = history.len();
+                }
+            }
+        }
+        Some(value) => {
+            let limit = value.parse::<usize>().ok();
+            result.stdout = format_history(history, limit);
+        }
+        None => {
+            result.stdout = format_history(history, None);
+        }
+    }
+
+    result
+}
+
 fn run_builtin(
     cmd: &str,
     args: &[String],
@@ -823,7 +912,13 @@ fn execute_pipeline(segments: Vec<Vec<ParsedToken>>, history: &[String]) {
 fn main() {
     #[cfg(unix)]
     let _raw_mode = RawModeGuard::new(STDIN_FILENO).ok();
-    let mut history = Vec::<String>::new();
+    let histfile = env::var_os("HISTFILE").map(PathBuf::from);
+    let mut history = if let Some(path) = histfile.as_ref() {
+        read_history_file(path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut history_last_persisted = history.len();
 
     loop {
         print!("{PROMPT}");
@@ -852,6 +947,22 @@ fn main() {
         };
         let args = tokens[1..].to_vec();
         ensure_redirect_files(&redirects);
+
+        if cmd == "history" {
+            let result = run_history_command(
+                &args,
+                &mut history,
+                histfile.as_ref(),
+                &mut history_last_persisted,
+            );
+            if !result.stdout.is_empty() {
+                write_bytes_output(&result.stdout, OutputStream::Stdout, &redirects);
+            }
+            if !result.stderr.is_empty() {
+                write_bytes_output(&result.stderr, OutputStream::Stderr, &redirects);
+            }
+            continue;
+        }
 
         if let Some(result) = run_builtin(&cmd, &args, true, true, &history) {
             if !result.stdout.is_empty() {
@@ -898,5 +1009,13 @@ fn main() {
             OutputStream::Stdout,
             &redirects,
         );
+    }
+
+    if let Some(path) = histfile.as_ref() {
+        if should_append_history_on_exit() {
+            let _ = append_history_file(path, &history, history_last_persisted);
+        } else {
+            let _ = write_history_file(path, &history);
+        }
     }
 }
