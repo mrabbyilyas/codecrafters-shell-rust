@@ -353,10 +353,17 @@ enum RedirectMode {
     Append,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RedirectSpec {
     stdout: Option<(PathBuf, RedirectMode)>,
     stderr: Option<(PathBuf, RedirectMode)>,
+}
+
+#[derive(Clone)]
+struct PipelineStage {
+    cmd: String,
+    args: Vec<String>,
+    redirects: RedirectSpec,
 }
 
 fn parse_redirections(tokens: Vec<ParsedToken>) -> (Vec<String>, RedirectSpec) {
@@ -419,6 +426,92 @@ fn parse_redirections(tokens: Vec<ParsedToken>) -> (Vec<String>, RedirectSpec) {
     (args, redirects)
 }
 
+fn split_pipeline(tokens: Vec<ParsedToken>) -> Vec<Vec<ParsedToken>> {
+    let mut stages = Vec::new();
+    let mut current = Vec::new();
+
+    for token in tokens {
+        if !token.quoted && token.text == "|" {
+            stages.push(current);
+            current = Vec::new();
+        } else {
+            current.push(token);
+        }
+    }
+
+    stages.push(current);
+    stages
+}
+
+fn is_builtin_command(cmd: &str) -> bool {
+    matches!(cmd, "echo" | "exit" | "type" | "pwd" | "cd")
+}
+
+#[derive(Default)]
+struct CommandResult {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    should_exit: bool,
+}
+
+fn run_builtin(cmd: &str, args: &[String], allow_exit: bool, apply_cd: bool) -> Option<CommandResult> {
+    let mut result = CommandResult::default();
+
+    match cmd {
+        "exit" => {
+            if allow_exit {
+                result.should_exit = true;
+            }
+        }
+        "echo" => {
+            result.stdout = format!("{}\n", args.join(" ")).into_bytes();
+        }
+        "pwd" => {
+            if let Ok(dir) = env::current_dir() {
+                result.stdout = format!("{}\n", dir.display()).into_bytes();
+            }
+        }
+        "cd" => {
+            if apply_cd {
+                if let Some(target) = args.first() {
+                    let resolved = if target == "~" {
+                        env::var_os("HOME").map(PathBuf::from)
+                    } else {
+                        Some(PathBuf::from(target))
+                    };
+
+                    match resolved {
+                        Some(path) => {
+                            if env::set_current_dir(&path).is_err() {
+                                result.stderr =
+                                    format!("cd: {target}: No such file or directory\n").into_bytes();
+                            }
+                        }
+                        None => {
+                            result.stderr =
+                                format!("cd: {target}: No such file or directory\n").into_bytes();
+                        }
+                    }
+                }
+            }
+        }
+        "type" => {
+            if let Some(query) = args.first() {
+                if is_builtin_command(query) {
+                    result.stdout = format!("{query} is a shell builtin\n").into_bytes();
+                } else if let Some(path) = find_in_path(query) {
+                    result.stdout = format!("{query} is {}\n", path.display()).into_bytes();
+                } else {
+                    result.stdout = format!("{query}: not found\n").into_bytes();
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(result)
+}
+
 fn open_redirect_file(path: &Path, mode: RedirectMode) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create(true);
@@ -447,7 +540,7 @@ enum OutputStream {
     Stderr,
 }
 
-fn write_output(text: &str, stream: OutputStream, redirects: &RedirectSpec) {
+fn write_bytes_output(bytes: &[u8], stream: OutputStream, redirects: &RedirectSpec) {
     let redirection = match stream {
         OutputStream::Stdout => &redirects.stdout,
         OutputStream::Stderr => &redirects.stderr,
@@ -455,20 +548,184 @@ fn write_output(text: &str, stream: OutputStream, redirects: &RedirectSpec) {
 
     if let Some((path, mode)) = redirection {
         if let Ok(mut file) = open_redirect_file(path, *mode) {
-            let _ = file.write_all(text.as_bytes());
+            let _ = file.write_all(bytes);
         }
         return;
     }
 
     match stream {
         OutputStream::Stdout => {
-            print!("{text}");
+            let _ = io::stdout().write_all(bytes);
             let _ = io::stdout().flush();
         }
         OutputStream::Stderr => {
-            eprint!("{text}");
+            let _ = io::stderr().write_all(bytes);
             let _ = io::stderr().flush();
         }
+    }
+}
+
+fn write_output(text: &str, stream: OutputStream, redirects: &RedirectSpec) {
+    write_bytes_output(text.as_bytes(), stream, redirects);
+}
+
+fn run_external_capture(stage: &PipelineStage, input: &[u8]) -> io::Result<CommandResult> {
+    let mut command = Command::new(&stage.cmd);
+    command.args(&stage.args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.stdin(Stdio::piped());
+
+    let mut child = command.spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+
+    let output = child.wait_with_output()?;
+    Ok(CommandResult {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        should_exit: false,
+    })
+}
+
+fn build_pipeline_stages(segments: Vec<Vec<ParsedToken>>) -> Vec<PipelineStage> {
+    let mut stages = Vec::new();
+    for segment in segments {
+        let (tokens, redirects) = parse_redirections(segment);
+        let Some(cmd) = tokens.first().cloned() else {
+            continue;
+        };
+        stages.push(PipelineStage {
+            cmd,
+            args: tokens[1..].to_vec(),
+            redirects,
+        });
+    }
+    stages
+}
+
+fn execute_external_pipeline(stages: &[PipelineStage]) {
+    if stages.is_empty() {
+        return;
+    }
+
+    for stage in stages {
+        if find_in_path(&stage.cmd).is_none() {
+            write_output(
+                &format!("{}: command not found\n", stage.cmd),
+                OutputStream::Stdout,
+                &stage.redirects,
+            );
+            return;
+        }
+        ensure_redirect_files(&stage.redirects);
+    }
+
+    let mut children = Vec::new();
+    let mut previous_stdout = None;
+    let last_index = stages.len() - 1;
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let mut command = Command::new(&stage.cmd);
+        command.args(&stage.args);
+
+        if let Some(stdout) = previous_stdout.take() {
+            command.stdin(Stdio::from(stdout));
+        }
+
+        if idx < last_index {
+            command.stdout(Stdio::piped());
+        } else if let Some((path, mode)) = &stage.redirects.stdout {
+            if let Ok(file) = open_redirect_file(path, *mode) {
+                command.stdout(Stdio::from(file));
+            }
+        }
+
+        if let Some((path, mode)) = &stage.redirects.stderr {
+            if let Ok(file) = open_redirect_file(path, *mode) {
+                command.stderr(Stdio::from(file));
+            }
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                write_output(
+                    &format!("{}: command not found\n", stage.cmd),
+                    OutputStream::Stdout,
+                    &stage.redirects,
+                );
+                return;
+            }
+        };
+
+        if idx < last_index {
+            previous_stdout = child.stdout.take();
+        }
+        children.push(child);
+    }
+
+    for child in &mut children {
+        let _ = child.wait();
+    }
+}
+
+fn execute_mixed_pipeline(stages: &[PipelineStage]) {
+    let mut stdin_buffer = Vec::new();
+
+    for (idx, stage) in stages.iter().enumerate() {
+        ensure_redirect_files(&stage.redirects);
+        let is_last = idx + 1 == stages.len();
+
+        let result = if let Some(result) = run_builtin(&stage.cmd, &stage.args, false, false) {
+            result
+        } else {
+            if find_in_path(&stage.cmd).is_none() {
+                write_output(
+                    &format!("{}: command not found\n", stage.cmd),
+                    OutputStream::Stdout,
+                    &stage.redirects,
+                );
+                return;
+            }
+
+            match run_external_capture(stage, &stdin_buffer) {
+                Ok(result) => result,
+                Err(_) => {
+                    write_output(
+                        &format!("{}: command not found\n", stage.cmd),
+                        OutputStream::Stdout,
+                        &stage.redirects,
+                    );
+                    return;
+                }
+            }
+        };
+
+        if !result.stderr.is_empty() {
+            write_bytes_output(&result.stderr, OutputStream::Stderr, &stage.redirects);
+        }
+
+        if is_last {
+            write_bytes_output(&result.stdout, OutputStream::Stdout, &stage.redirects);
+        } else {
+            stdin_buffer = result.stdout;
+        }
+    }
+}
+
+fn execute_pipeline(segments: Vec<Vec<ParsedToken>>) {
+    let stages = build_pipeline_stages(segments);
+    if stages.is_empty() {
+        return;
+    }
+
+    if stages.iter().all(|stage| !is_builtin_command(&stage.cmd)) {
+        execute_external_pipeline(&stages);
+    } else {
+        execute_mixed_pipeline(&stages);
     }
 }
 
@@ -485,91 +742,29 @@ fn main() {
         };
 
         let tokens = parse_line(&input);
-        let (tokens, redirects) = parse_redirections(tokens);
+        let mut pipeline_segments = split_pipeline(tokens);
+        if pipeline_segments.len() > 1 {
+            execute_pipeline(pipeline_segments);
+            continue;
+        }
+
+        let segment = pipeline_segments.pop().unwrap_or_default();
+        let (tokens, redirects) = parse_redirections(segment);
         let Some(cmd) = tokens.first().cloned() else {
             continue;
         };
         let args = tokens[1..].to_vec();
         ensure_redirect_files(&redirects);
 
-        if cmd == "exit" {
-            break;
-        }
-
-        if cmd == "echo" {
-            let output = args.join(" ");
-            write_output(&format!("{output}\n"), OutputStream::Stdout, &redirects);
-            continue;
-        }
-
-        if cmd == "pwd" {
-            if let Ok(dir) = env::current_dir() {
-                write_output(
-                    &format!("{}\n", dir.display()),
-                    OutputStream::Stdout,
-                    &redirects,
-                );
+        if let Some(result) = run_builtin(&cmd, &args, true, true) {
+            if !result.stdout.is_empty() {
+                write_bytes_output(&result.stdout, OutputStream::Stdout, &redirects);
             }
-            continue;
-        }
-
-        if cmd == "cd" {
-            if let Some(target) = args.first() {
-                let resolved = if target == "~" {
-                    env::var_os("HOME").map(PathBuf::from)
-                } else {
-                    Some(PathBuf::from(target))
-                };
-
-                match resolved {
-                    Some(path) => {
-                        if env::set_current_dir(&path).is_err() {
-                            write_output(
-                                &format!("cd: {target}: No such file or directory\n"),
-                                OutputStream::Stderr,
-                                &redirects,
-                            );
-                        }
-                    }
-                    None => {
-                        write_output(
-                            &format!("cd: {target}: No such file or directory\n"),
-                            OutputStream::Stderr,
-                            &redirects,
-                        );
-                    }
-                }
+            if !result.stderr.is_empty() {
+                write_bytes_output(&result.stderr, OutputStream::Stderr, &redirects);
             }
-            continue;
-        }
-
-        if cmd == "type" {
-            if let Some(query) = args.first() {
-                match query.as_str() {
-                    "echo" | "exit" | "type" | "pwd" | "cd" => {
-                        write_output(
-                            &format!("{query} is a shell builtin\n"),
-                            OutputStream::Stdout,
-                            &redirects,
-                        );
-                    }
-                    _ => match find_in_path(query) {
-                        Some(path) => {
-                            write_output(
-                                &format!("{query} is {}\n", path.display()),
-                                OutputStream::Stdout,
-                                &redirects,
-                            );
-                        }
-                        None => {
-                            write_output(
-                                &format!("{query}: not found\n"),
-                                OutputStream::Stdout,
-                                &redirects,
-                            );
-                        }
-                    },
-                }
+            if result.should_exit {
+                break;
             }
             continue;
         }
